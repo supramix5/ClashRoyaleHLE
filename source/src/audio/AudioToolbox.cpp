@@ -1,4 +1,4 @@
-// AudioToolbox ExtAudioFile for the sound effects (PCM WAV), decoding to the client format the app requests.
+// AudioToolbox ExtAudioFile for WAV sound effects, decoding PCM, Microsoft IMA ADPCM, and Microsoft ADPCM.
 // AudioStreamBasicDescription (40 bytes): mSampleRate (double) +0, mFormatID +8, mFormatFlags +12, mBytesPerPacket +16,
 // mFramesPerPacket +20, mBytesPerFrame +24, mChannelsPerFrame +28, mBitsPerChannel +32.
 #include "foundation/Foundation.h"
@@ -6,6 +6,7 @@
 #include "Memory.h"
 #include "libc/Files.h"
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -15,8 +16,10 @@ using hle::ret;
 namespace {
 struct AudioFile {
     std::vector<std::int16_t> samples; // interleaved 16-bit
+    std::vector<std::int16_t> clientSamples;
     int channels = 1, rate = 44100;
-    std::uint64_t frames = 0, position = 0;
+    int clientChannels = 1, clientRate = 44100;
+    std::uint64_t frames = 0, clientFrames = 0, position = 0;
     int clientBits = 16;
 };
 std::mutex g_lock;
@@ -107,6 +110,8 @@ void decodeMsAdpcm(const unsigned char *data, std::size_t size, int channels, in
 bool parseWav(const std::string &bytes, AudioFile &f) {
     if (bytes.size() < 12 || bytes.compare(0, 4, "RIFF") || bytes.compare(8, 4, "WAVE")) return false;
     int bits = 16, format = 1, blockAlign = 0;
+    std::uint32_t factFrames = 0;
+    bool hasFact = false;
     for (std::size_t o = 12; o + 8 <= bytes.size();) {
         const auto id = bytes.substr(o, 4);
         const auto size = u32(bytes, o + 4);
@@ -116,6 +121,10 @@ bool parseWav(const std::string &bytes, AudioFile &f) {
             f.rate = int(u32(bytes, o + 12));
             blockAlign = u16(bytes, o + 20);
             bits = u16(bytes, o + 22);
+        } else if (id == "fact") {
+            if (size < 4) return false;
+            factFrames = u32(bytes, o + 8);
+            hasFact = true;
         } else if (id == "data") {
             const auto end = std::min<std::size_t>(bytes.size(), o + 8 + size);
             if (format == 0x11) {
@@ -139,17 +148,55 @@ bool parseWav(const std::string &bytes, AudioFile &f) {
         }
         o += 8 + size + (size & 1);
     }
+    if (f.channels < 1 || f.channels > 2 || f.rate <= 0) return false;
+    if (hasFact && (format == 0x11 || format == 2)) {
+        const auto decodedFrames = f.samples.size() / std::size_t(f.channels);
+        if (factFrames > decodedFrames) return false;
+        f.samples.resize(std::size_t(factFrames) * std::size_t(f.channels));
+    }
     f.frames = f.channels ? f.samples.size() / std::size_t(f.channels) : 0;
+    f.clientChannels = f.channels;
+    f.clientRate = f.rate;
+    f.clientFrames = f.frames;
     return true;
 }
-void writeAsbd(std::uint64_t p, const AudioFile &f, int bits) {
-    mem::write<double>(p, double(f.rate));
+void convertClientFormat(AudioFile &f) {
+    f.clientSamples.clear();
+    f.clientFrames = f.frames;
+    if (f.clientRate != f.rate)
+        f.clientFrames = std::uint64_t(std::llround(double(f.frames) * f.clientRate / f.rate));
+    if (f.clientChannels == f.channels && f.clientRate == f.rate) return;
+
+    f.clientSamples.resize(std::size_t(f.clientFrames) * std::size_t(f.clientChannels));
+    for (std::uint64_t frame = 0; frame < f.clientFrames; ++frame) {
+        const double sourcePosition = double(frame) * f.rate / f.clientRate;
+        const auto first = std::min<std::uint64_t>(std::uint64_t(sourcePosition), f.frames - 1);
+        const auto second = std::min(first + 1, f.frames - 1);
+        const double fraction = sourcePosition - double(first);
+        double source[2]{};
+        for (int channel = 0; channel < f.channels; ++channel) {
+            const auto firstSample = f.samples[std::size_t(first) * std::size_t(f.channels) + std::size_t(channel)];
+            const auto secondSample = f.samples[std::size_t(second) * std::size_t(f.channels) + std::size_t(channel)];
+            source[channel] = firstSample + (secondSample - firstSample) * fraction;
+        }
+        for (int channel = 0; channel < f.clientChannels; ++channel) {
+            const double sample = f.channels == 1 ? source[0] :
+                (f.clientChannels == 1 ? (source[0] + source[1]) * 0.5 : source[channel]);
+            f.clientSamples[std::size_t(frame) * std::size_t(f.clientChannels) + std::size_t(channel)] =
+                std::int16_t(std::clamp(std::lround(sample), -32768l, 32767l));
+        }
+    }
+}
+void writeAsbd(std::uint64_t p, const AudioFile &f, int bits, bool clientFormat) {
+    const int rate = clientFormat ? f.clientRate : f.rate;
+    const int channels = clientFormat ? f.clientChannels : f.channels;
+    mem::write<double>(p, double(rate));
     mem::w32(p + 8, 0x6C70636D); // 'lpcm'
     mem::w32(p + 12, 0xC);       // signed integer, packed
-    mem::w32(p + 16, std::uint32_t(f.channels * bits / 8));
+    mem::w32(p + 16, std::uint32_t(channels * bits / 8));
     mem::w32(p + 20, 1);
-    mem::w32(p + 24, std::uint32_t(f.channels * bits / 8));
-    mem::w32(p + 28, std::uint32_t(f.channels));
+    mem::w32(p + 24, std::uint32_t(channels * bits / 8));
+    mem::w32(p + 28, std::uint32_t(channels));
     mem::w32(p + 32, std::uint32_t(bits));
     mem::w32(p + 36, 0);
 }
@@ -177,8 +224,8 @@ HLE(ExtAudioFileGetProperty) {
     if (found == g_files.end()) return ret(std::uint64_t(std::int64_t(-50)));
     const auto &f = found->second;
     switch (std::uint32_t(arg(1))) {
-    case 0x66666D74: writeAsbd(arg(3), f, 16); break;          // 'ffmt'
-    case 0x63666D74: writeAsbd(arg(3), f, f.clientBits); break; // 'cfmt'
+    case 0x66666D74: writeAsbd(arg(3), f, 16, false); break;           // 'ffmt'
+    case 0x63666D74: writeAsbd(arg(3), f, f.clientBits, true); break; // 'cfmt'
     case 0x2366726D: mem::w64(arg(3), f.frames); break;         // '#frm'
     default: return ret(std::uint64_t(std::int64_t(-50)));
     }
@@ -188,7 +235,24 @@ HLE(ExtAudioFileSetProperty) {
     std::lock_guard lock(g_lock);
     auto found = g_files.find(arg(0));
     if (found == g_files.end()) return ret(std::uint64_t(std::int64_t(-50)));
-    if (std::uint32_t(arg(1)) == 0x63666D74) found->second.clientBits = int(mem::r32(arg(3) + 32)) == 8 ? 8 : 16;
+    if (std::uint32_t(arg(1)) == 0x63666D74) {
+        auto &f = found->second;
+        const double rate = mem::read<double>(arg(3));
+        const auto channels = int(mem::r32(arg(3) + 28));
+        const auto bits = int(mem::r32(arg(3) + 32));
+        const auto roundedRate = std::isfinite(rate) && rate >= 0.5 && rate <= 384000.5 ? std::lround(rate) : 0;
+        if (!std::isfinite(rate) || roundedRate < 1 || roundedRate > 384000 || channels < 1 || channels > 2 ||
+            (bits != 8 && bits != 16) || (f.frames && !f.rate)) {
+            hlog("audio", "ExtAudioFileSetProperty: unsupported client format (%.0f Hz, %d channels, %d bits)",
+                 rate, channels, bits);
+            return ret(std::uint64_t(std::int64_t(-50)));
+        }
+        f.clientRate = int(roundedRate);
+        f.clientChannels = channels;
+        f.clientBits = bits;
+        convertClientFormat(f);
+        f.position = 0;
+    }
     ret(0);
 }
 // ExtAudioFileRead(file, UInt32 *ioNumberFrames, AudioBufferList *): buffers at +8 {channels, byteSize, data}.
@@ -198,12 +262,13 @@ HLE(ExtAudioFileRead) {
     if (found == g_files.end()) return ret(std::uint64_t(std::int64_t(-50)));
     auto &f = found->second;
     const auto list = arg(2);
-    const int bytesPerFrame = f.channels * f.clientBits / 8;
+    const int bytesPerFrame = f.clientChannels * f.clientBits / 8;
     const auto capacity = mem::r32(list + 12) / std::uint32_t(std::max(1, bytesPerFrame));
-    const auto wanted = std::min<std::uint64_t>(std::min<std::uint64_t>(mem::r32(arg(1)), capacity), f.frames - f.position);
+    const auto wanted = std::min<std::uint64_t>(std::min<std::uint64_t>(mem::r32(arg(1)), capacity), f.clientFrames - f.position);
     const auto out = mem::r64(list + 16);
-    for (std::uint64_t i = 0; i < wanted * std::uint64_t(f.channels); ++i) {
-        const auto sample = f.samples[std::size_t(f.position * std::uint64_t(f.channels) + i)];
+    const auto &samples = f.clientSamples.empty() ? f.samples : f.clientSamples;
+    for (std::uint64_t i = 0; i < wanted * std::uint64_t(f.clientChannels); ++i) {
+        const auto sample = samples[std::size_t(f.position * std::uint64_t(f.clientChannels) + i)];
         if (f.clientBits == 8) mem::write<std::uint8_t>(out + i, std::uint8_t((sample >> 8) + 128));
         else mem::write<std::int16_t>(out + 2 * i, sample);
     }

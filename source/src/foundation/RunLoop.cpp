@@ -31,7 +31,7 @@ std::vector<std::pair<Clock::time_point, std::function<void()>>> g_posted;
 std::function<void()> &pump() { static std::function<void()> f; return f; } // set from other files
 Clock::time_point g_nextFrame = Clock::now();
 double g_frameTimestamp = 0;
-constexpr auto kFrame = std::chrono::nanoseconds(16666667);
+constexpr auto kFrame = std::chrono::nanoseconds(8333332); // 16666667 = 60FPS
 
 void runTimer(std::uint64_t timer, const TimerInfo &info) {
     if (info.block) sys::callBlock(info.block, {timer});
