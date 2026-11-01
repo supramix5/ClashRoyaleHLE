@@ -258,6 +258,11 @@ void drawTypingBar(int windowWidth, int) {
     int w = 0, h = 0;
     const auto shown = responderText() + caret;
     if (uikit::renderTextLine(shown, 22, text, w, h)) {
+        // The image's rows are tightly packed; the game leaves GL_UNPACK_ALIGNMENT at 8, which would pad every row of an
+        // odd-width image and slant the text. The game's value is restored afterwards.
+        GLint alignment = 4;
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         // The text image is top-row first: draw it downwards from the raster position with a -1 vertical zoom.
         glPixelZoom(1.f, -1.f);
         std::vector<std::uint8_t> &flipped = text;
@@ -265,6 +270,7 @@ void drawTypingBar(int windowWidth, int) {
         windowPos(w > windowWidth - 16 ? windowWidth - 8 - w : x, (barHeight + h) / 2);
         glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, flipped.data());
         glPixelZoom(1.f, 1.f);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
     }
     glBlendFunc(GLenum(blendSrc), GLenum(blendDst));
     if (!blend) glDisable(GL_BLEND);
